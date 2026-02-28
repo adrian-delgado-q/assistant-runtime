@@ -1,0 +1,25 @@
+root = "."
+tmp_dir = "/tmp/air"
+
+[build]
+  cmd = "CGO_ENABLED=1 go build -o /tmp/air/clearoutspaces-api ./cmd/api/main.go"
+  bin = "/tmp/air/clearoutspaces-api"
+  full_bin = "/tmp/air/clearoutspaces-api"
+  include_ext = ["go", "yaml"]
+  exclude_dir = ["vendor"]
+  delay = 500
+  kill_delay = 200
+  rerun = false
+  log = "air.log"
+
+[log]
+  time = true
+
+[color]
+  main = "magenta"
+  watcher = "cyan"
+  build = "yellow"
+  runner = "green"
+
+[misc]
+  clean_on_exit = true

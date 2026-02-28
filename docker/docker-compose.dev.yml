@@ -1,0 +1,15 @@
+# Development only — hot reload via air, no tunnel, no Cal.com.
+# Usage: docker compose -f docker/docker-compose.dev.yml up
+services:
+  api:
+    build:
+      context: ../app
+      dockerfile: ../docker/Dockerfile.dev
+    container_name: clearoutspaces_api_dev
+    ports:
+      - "8080:8080"
+    volumes:
+      - ../app:/app          # live source mount — air rebuilds on change
+      - ../data:/data        # persist SQLite between restarts
+    env_file:
+      - ../.env

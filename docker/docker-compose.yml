@@ -1,0 +1,61 @@
+services:
+  api:
+    build:
+      context: ../app
+      dockerfile: ../docker/Dockerfile
+    container_name: clearoutspaces_api
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ../data:/data
+    env_file:
+      - ../.env
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: clearoutspaces_tunnel
+    restart: unless-stopped
+    command: tunnel run
+    environment:
+      - TUNNEL_TOKEN=${TUNNEL_TOKEN}
+    depends_on:
+      api:
+        condition: service_healthy
+
+  cal_db:
+    image: postgres:15-alpine
+    container_name: clearoutspaces_cal_db
+    restart: unless-stopped
+    volumes:
+      - cal_db_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: calcom
+      POSTGRES_PASSWORD: ${CAL_DB_PASSWORD}
+      POSTGRES_DB: calcom
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U calcom"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  calcom:
+    image: calcom/cal.com:latest
+    container_name: clearoutspaces_calendar
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+    env_file:
+      - ../.env
+    depends_on:
+      cal_db:
+        condition: service_healthy
+
+volumes:
+  cal_db_data:

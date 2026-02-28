@@ -1,0 +1,218 @@
+ClearoutSpaces: AI Workflow MVP Blueprint & Technical SpecsThis is the comprehensive playbook and technical specification for the ClearoutSpaces WhatsApp AI Assistant.Core Architecture StackAPI / Logic: Go (listening on http://localhost:8080)Database: SQLite (/data/clearoutspaces/db.sqlite)Network / Ingress: Cloudflare Tunnel (api.clearoutspaces.ca → localhost:8080, bookings.clearoutspaces.ca → localhost:3000)Staff Interface: Slack Free (Incoming Webhooks + Interactive Block Kit Buttons)Customer Interface: WhatsApp Cloud API (Meta)AI Engine: DeepSeek LLM (JSON-mode schema routing)Scheduling: Self-hosted Cal.com (bookings.clearoutspaces.ca)Deployment: Docker & Docker Compose0. What "Done" Looks Like (The MVP Flow)Inbound: User messages via WhatsApp.Processing: Meta sends a webhook to api.clearoutspaces.ca/whatsapp/webhook.State Machine: Go API saves the message to SQLite, loads the conversation history, and reads the rules from a local .yaml file.AI Routing: Go sends the history + YAML rules to DeepSeek, demanding a JSON response.Execution: DeepSeek returns JSON containing:The exact text to reply to the user.The updated quote data (address, stairs, etc.).The current state (continue, schedule, handoff).Action: * If continue: API replies to WhatsApp.If schedule: API replies with a link to bookings.clearoutspaces.ca.If handoff: API fires a Slack webhook with a summary and a "Take Over" button.1. Infrastructure & DeploymentWe will deploy the application and the Cloudflare Tunnel securely using Docker Compose. We will separate the Go API and Cal.com into two distinct Compose files to keep the MVP API lightweight.1.1 Server Directory StructureOn your VPS, create the following structure. Note the expanded Go internal structure./opt/clearoutspaces/
+├── .env                  # Global secrets (Meta, DeepSeek, Slack)
+├── docker-compose.yml    # Go API + Cloudflare Tunnel
+├── app/                  # Go Application Code
+│   ├── Dockerfile
+│   ├── go.mod
+│   ├── go.sum
+│   ├── cmd/
+│   │   └── api/
+│   │       └── main.go         # Application entry point & Router setup
+│   ├── internal/
+│   │   ├── config/             # Environment variable loading
+│   │   ├── database/           # SQLite connection & query functions
+│   │   ├── handlers/           # HTTP Handlers (Webhook logic)
+│   │   ├── llm/                # DeepSeek API client logic
+│   │   └── models/             # Go Structs for JSON parsing
+│   └── templates/
+│       └── system_prompt.yaml  # AI Brain
+├── data/                       # Go App Persistent Data
+│   └── files/ 
+└── calcom/                     # Calendar Infrastructure
+    ├── docker-compose.yml
+    └── .env.cal                # Cal.com specific secrets
+1.2 Dockerfile (Go API)Note: Since SQLite requires CGO, we use a multi-stage build with gcc and musl-dev.# /opt/clearoutspaces/app/Dockerfile
+FROM golang:1.22-alpine AS builder
+WORKDIR /app
+RUN apk add --no-cache gcc musl-dev
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=1 GOOS=linux go build -o clearoutspaces-api ./cmd/api/main.go
+
+FROM alpine:latest
+WORKDIR /app
+RUN apk add --no-cache ca-certificates tzdata
+ENV TZ=America/Toronto
+COPY --from=builder /app/clearoutspaces-api .
+COPY templates/ templates/
+EXPOSE 8080
+CMD ["./clearoutspaces-api"]
+1.3 Docker Compose Configuration (Go API + Tunnel)# /opt/clearoutspaces/docker-compose.yml
+version: '3.8'
+
+services:
+  api:
+    build: ./app
+    container_name: clearoutspaces_api
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./data:/data
+    env_file:
+      - .env
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: clearoutspaces_tunnel
+    restart: unless-stopped
+    command: tunnel run
+    env_file:
+      - .env
+    depends_on:
+      - api
+1.4 Docker Compose Configuration (Cal.com)Cal.com requires its own PostgreSQL database. By keeping it in /opt/clearoutspaces/calcom/, it won't interfere with your Go API's SQLite database.# /opt/clearoutspaces/calcom/docker-compose.yml
+version: '3.8'
+
+services:
+  calcom:
+    image: calcom/cal.com:latest
+    container_name: clearoutspaces_calendar
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+    env_file:
+      - .env.cal
+    depends_on:
+      - cal_db
+
+  cal_db:
+    image: postgres:13-alpine
+    container_name: clearoutspaces_cal_db
+    restart: unless-stopped
+    volumes:
+      - cal_db_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: calcom
+      POSTGRES_PASSWORD: ${CAL_DB_PASSWORD}
+      POSTGRES_DB: calcom
+
+volumes:
+  cal_db_data:
+Note: You will need to configure your Cloudflare Tunnel (cloudflared) to route bookings.clearoutspaces.ca to http://localhost:3000 alongside the API route.2. Go API Structure & RoutesUsing Go 1.22+'s built-in net/http ServeMux, your router definition in app/cmd/api/main.go will look exactly like this:// app/cmd/api/main.go
+package main
+
+import (
+    "log"
+    "net/http"
+    "clearoutspaces/internal/handlers"
+    "clearoutspaces/internal/database"
+)
+
+func main() {
+    // 1. Init dependencies
+    db := database.Init("/data/db.sqlite")
+    
+    // 2. Setup Router
+    mux := http.NewServeMux()
+
+    // 3. Define Routes (Endpoint Contracts)
+    mux.HandleFunc("GET /health", handlers.HealthCheck)
+    
+    // Meta/WhatsApp Webhook Routes
+    mux.HandleFunc("GET /whatsapp/webhook", handlers.VerifyWebhook)
+    mux.HandleFunc("POST /whatsapp/webhook", handlers.HandleWhatsAppMessage(db))
+    
+    // Slack Control Route
+    mux.HandleFunc("POST /slack/interactive", handlers.HandleSlackInteractive(db))
+
+    // 4. Start Server
+    log.Println("Server starting on :8080")
+    http.ListenAndServe(":8080", mux)
+}
+3. SQLite Database SchemaThe database will reside at /data/db.sqlite (mapped via Docker volume). Upon startup, the Go API should execute these migrations if the tables do not exist:-- conversations table
+CREATE TABLE IF NOT EXISTS conversations (
+    id TEXT PRIMARY KEY, -- WhatsApp Phone Number or UUID
+    phone_number TEXT NOT NULL,
+    status TEXT DEFAULT 'ACTIVE', -- 'ACTIVE' or 'PAUSED'
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- messages table
+CREATE TABLE IF NOT EXISTS messages (
+    id TEXT PRIMARY KEY, -- WhatsApp Message ID or generated UUID
+    conversation_id TEXT NOT NULL,
+    role TEXT NOT NULL, -- 'user', 'assistant', 'system'
+    content TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(conversation_id) REFERENCES conversations(id)
+);
+
+-- quote_data table
+CREATE TABLE IF NOT EXISTS quote_data (
+    conversation_id TEXT PRIMARY KEY,
+    json_dump TEXT, -- The raw JSON extracted by DeepSeek
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(conversation_id) REFERENCES conversations(id)
+);
+4. The YAML Template BrainYour API reads this on boot. It defines the persona and rules sent to DeepSeek.# /opt/clearoutspaces/app/templates/system_prompt.yaml
+identity: "You are the ClearoutSpaces assistant. Be brief, friendly, and professional."
+business_rules:
+  - "We service the GTA (Mississauga, Brampton, Vaughan, Toronto)."
+  - "We do NOT take hazardous waste or wet paint."
+  - "Never provide exact pricing. State that the team will review the details to provide a quote."
+quote_fields_needed:
+  - address
+  - elevator_access
+  - stairs
+  - inventory
+workflow: "Ask max 1 question at a time. When all fields are collected, set action to 'handoff'."
+5. DeepSeek LLM JSON Schema ContractWhen calling the DeepSeek API, inject the system prompt, the conversation history, and strictly enforce this JSON schema structure in your prompt instructions (and use response_format: {"type": "json_object"}):{
+  "reply_to_user": "Sounds good! Are there any stairs involved?",
+  "extracted_data": {
+    "address": "123 Main St",
+    "elevator_access": "unknown",
+    "stairs": "unknown",
+    "inventory": "1 couch, 2 chairs"
+  },
+  "action": "continue" // Must be one of: "continue", "handoff", "schedule"
+}
+6. API Endpoint ContractsYour Go application must expose the following HTTP routes.6.1 Health CheckMethod: GET /healthResponse: 200 OK {"status": "healthy"}6.2 WhatsApp Webhook Verification (Meta Requirement)Method: GET /whatsapp/webhookQuery Params: hub.mode, hub.challenge, hub.verify_tokenResponse: 200 OK with raw hub.challenge string (if token matches).6.3 WhatsApp Inbound MessageMethod: POST /whatsapp/webhookHeaders: X-Hub-Signature-256 (Must be verified using META_APP_SECRET)Payload (Simplified Meta Format):{
+  "object": "whatsapp_business_account",
+  "entry": [{
+    "changes": [{
+      "value": {
+        "messages": [{
+          "from": "14165551234",
+          "id": "wamid.HBg...",
+          "text": { "body": "I need a couch removed." }
+        }]
+      }
+    }]
+  }]
+}
+Response: 200 OK (Must return immediately to Meta, process logic asynchronously).6.4 Slack Interactive (Button Clicks)Method: POST /slack/interactiveHeaders: X-Slack-Signature, X-Slack-Request-Timestamp (Must be verified).Content-Type: application/x-www-form-urlencodedPayload structure (URL Decoded payload parameter):{
+  "type": "block_actions",
+  "user": { "id": "U123456", "username": "staff" },
+  "actions": [{
+    "action_id": "take_over_chat",
+    "value": "14165551234" // The conversation ID/Phone Number
+  }]
+}
+Response: 200 OK{
+  "replace_original": true,
+  "text": "✅ Chat paused. Staff has taken over the conversation."
+}
+7. Integrations Summary7.1 Outbound to Slack (Handoff)When action: handoff, Go POSTs to SLACK_WEBHOOK_URL:{
+  "text": "New Quote Request from +1 416-555-1234",
+  "blocks": [
+    {
+      "type": "section",
+      "text": { "type": "mrkdwn", "text": "*New Quote Request*\n*Phone:* 14165551234\n*Inventory:* 1 couch, 2 chairs" }
+    },
+    {
+      "type": "actions",
+      "elements": [
+        {
+          "type": "button",
+          "text": { "type": "plain_text", "text": "Take Over Chat" },
+          "action_id": "take_over_chat",
+          "value": "14165551234"
+        }
+      ]
+    }
+  ]
+}
+7.2 Self-Hosted Cal.com IntegrationWhen action: schedule, Go automatically replies to WhatsApp via Meta API:"You can pick a time for an on-site assessment here: https://www.google.com/search?q=https://bookings.clearoutspaces.ca/clearoutspaces/assessment"8. The "Build Tonight" Step-by-Step OrderPhase 1: Foundation. Setup .env, docker-compose.yml, and Dockerfile. Write a basic Go main.go with a /health endpoint. docker-compose up -d. Verify via Cloudflare Tunnel.Phase 2: Database. Add mattn/go-sqlite3. Execute the CREATE TABLE statements on boot.Phase 3: Meta Webhook. Create GET and POST for /whatsapp/webhook. Implement HMAC signature verification. Log incoming messages to SQLite.Phase 4: Calendar Infrastructure. Navigate to calcom/, configure .env.cal, and run docker-compose up -d. Add the bookings. route to your Cloudflare config.Phase 5: The Brain. Implement the DeepSeek API call in your Go API. Hook up templates/system_prompt.yaml. Enforce the JSON output structure and save the extracted_data to SQLite.Phase 6: Slack Handoff. Create the Slack App. Send the Block Kit payload to the webhook when DeepSeek returns handoff.Phase 7: Slack Control. Implement POST /slack/interactive to catch the button click, verify the Slack signature, and flip the SQLite conversation status to PAUSED.
